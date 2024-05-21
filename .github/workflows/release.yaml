@@ -1,261 +1,262 @@
-#
-# Copyright (c) 2017 Angelo Zerr and other contributors as
-# indicated by the @author tags.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-
-name: Release
-
-on:
-  # manual trigger
-  workflow_dispatch:
-  # build on new tags
-  push:
-    tags:
-      - '*'
-
 env:
   JAVA_VERSION: '17'
-
 jobs:
   build:
-    name: 'Build with Graal on ${{ matrix.os }}'
+    name: Build with Graal on ${{ matrix.os }}
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Check out repository
+      uses: actions/checkout@v4
+    - continue-on-error: true
+      name: Set vars
+      run: 'OS=$(echo ''${{ runner.os }}'' | awk ''{print tolower($0)}'')
+
+        [[ $OS == ''ubuntu'' ]] && echo "OS=linux" >> $GITHUB_ENV || echo "OS=$OS"
+        >> $GITHUB_ENV
+
+        [[ $OS == ''macos'' ]] && echo "OS=darwin" >> $GITHUB_ENV || echo "OS=$OS"
+        >> $GITHUB_ENV
+
+        echo "VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)"
+        >> $GITHUB_ENV
+
+        '
+      shell: bash
+    - continue-on-error: true
+      name: Set up Graal
+      uses: graalvm/setup-graalvm@v1
+      with:
+        components: native-image
+        distribution: graalvm
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        java-version: ${{ env.JAVA_VERSION }}
+    - continue-on-error: true
+      name: Maven clean
+      run: ./mvnw clean -Dmrm=false -B -ntp -e
+    - continue-on-error: true
+      if: ${{ env.OS == 'linux' }}
+      name: Patch Graal libs for only requiring glibc 2.12
+      run: "mkdir -p client/target/graalvm-libs-for-glibc-2.12\n\n: patch common libraries\n\
+        ( find \"$GRAALVM_HOME/lib/static/linux-amd64/glibc\" -name '*.a'\n  ls -1\
+        \ /lib/x86_64-linux-gnu/libz.a\n  ls -1 \"$GRAALVM_HOME/lib/svm/clibraries/linux-amd64/libjvm.a\"\
+        \n  ls -1 \"$GRAALVM_HOME/lib/svm/clibraries/linux-amd64/liblibchelper.a\"\
+        \n) | while IFS= read -r input; do\n      output=\"client/target/graalvm-libs-for-glibc-2.12/$(basename\
+        \ -- \"$input\")\"\n      objcopy --redefine-syms=client/src/main/resources/glibc/glibc.redef\
+        \ -- \"$input\" \"$output\" 2>/dev/null\n    done\n\n: patch gcc startfile\n\
+        gcc -O3 -Os -Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wcast-qual\
+        \ -pedantic -c -o client/target/dynamic-libc-start.o client/src/main/resources/glibc/dynamic-libc-start.c\n\
+        ld -r /lib/x86_64-linux-gnu/Scrt1.o client/target/dynamic-libc-start.o -o\
+        \ client/target/graalvm-libs-for-glibc-2.12/Scrt1.o\nobjcopy --redefine-syms=client/src/main/resources/glibc/glibc.redef\
+        \ client/target/graalvm-libs-for-glibc-2.12/Scrt1.o 2>/dev/null\n"
+      shell: bash
+    - continue-on-error: true
+      name: Build native distribution
+      run: ./mvnw verify -Pnative -Dmrm=false -B -ntp -e -DskipTests -s .mvn/release-settings.xml
+    - continue-on-error: true
+      if: ${{ env.OS == 'linux' }}
+      name: Verify native binary for only requiring glibc 2.12
+      run: '(( 4 == "$(ldd client/target/mvnd | awk ''{print $1}'' | sort -u | grep
+        -c ''lib\(c\|dl\|rt\|pthread\)\.so\.[0-9]'')" )) || ( ldd client/target/mvnd
+        && false )
+
+        err=0
+
+        objdump -T client/target/mvnd | grep GLIBC_ | grep -v ''GLIBC_\([01]\|2\.[0-9]\|2\.1[012]\)[^0-9]''
+        || err=$?
+
+        (( err == 1 ))
+
+        '
+      shell: bash
+    - continue-on-error: true
+      name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: artifacts
+        path: 'dist/target/maven-mvnd-*.zip
+
+          dist/target/maven-mvnd-*.tar.gz
+
+          '
     strategy:
       fail-fast: true
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: 'Check out repository'
-        uses: actions/checkout@v4
-
-      - name: 'Set vars'
-        shell: bash
-        run: |
-          OS=$(echo '${{ runner.os }}' | awk '{print tolower($0)}')
-          [[ $OS == 'ubuntu' ]] && echo "OS=linux" >> $GITHUB_ENV || echo "OS=$OS" >> $GITHUB_ENV
-          [[ $OS == 'macos' ]] && echo "OS=darwin" >> $GITHUB_ENV || echo "OS=$OS" >> $GITHUB_ENV
-          echo "VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_ENV
-
-      - name: 'Set up Graal'
-        uses: graalvm/setup-graalvm@v1
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'graalvm'
-          components: 'native-image'
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 'Maven clean'
-        run: ./mvnw clean -Dmrm=false -B -ntp -e
-
-      - name: 'Patch Graal libs for only requiring glibc 2.12'
-        if: ${{ env.OS == 'linux' }}
-        shell: bash
-        run: |
-          mkdir -p client/target/graalvm-libs-for-glibc-2.12
-
-          : patch common libraries
-          ( find "$GRAALVM_HOME/lib/static/linux-amd64/glibc" -name '*.a'
-            ls -1 /lib/x86_64-linux-gnu/libz.a
-            ls -1 "$GRAALVM_HOME/lib/svm/clibraries/linux-amd64/libjvm.a"
-            ls -1 "$GRAALVM_HOME/lib/svm/clibraries/linux-amd64/liblibchelper.a"
-          ) | while IFS= read -r input; do
-                output="client/target/graalvm-libs-for-glibc-2.12/$(basename -- "$input")"
-                objcopy --redefine-syms=client/src/main/resources/glibc/glibc.redef -- "$input" "$output" 2>/dev/null
-              done
-
-          : patch gcc startfile
-          gcc -O3 -Os -Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wcast-qual -pedantic -c -o client/target/dynamic-libc-start.o client/src/main/resources/glibc/dynamic-libc-start.c
-          ld -r /lib/x86_64-linux-gnu/Scrt1.o client/target/dynamic-libc-start.o -o client/target/graalvm-libs-for-glibc-2.12/Scrt1.o
-          objcopy --redefine-syms=client/src/main/resources/glibc/glibc.redef client/target/graalvm-libs-for-glibc-2.12/Scrt1.o 2>/dev/null
-
-      - name: 'Build native distribution'
-        run: ./mvnw verify -Pnative -Dmrm=false -B -ntp -e -DskipTests -s .mvn/release-settings.xml
-
-      - name: 'Verify native binary for only requiring glibc 2.12'
-        if: ${{ env.OS == 'linux' }}
-        shell: bash
-        run: |
-          (( 4 == "$(ldd client/target/mvnd | awk '{print $1}' | sort -u | grep -c 'lib\(c\|dl\|rt\|pthread\)\.so\.[0-9]')" )) || ( ldd client/target/mvnd && false )
-          err=0
-          objdump -T client/target/mvnd | grep GLIBC_ | grep -v 'GLIBC_\([01]\|2\.[0-9]\|2\.1[012]\)[^0-9]' || err=$?
-          (( err == 1 ))
-
-      - name: 'Upload artifact'
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifacts
-          path: |
-            dist/target/maven-mvnd-*.zip
-            dist/target/maven-mvnd-*.tar.gz
-
-  source:
-    name: 'Build source distributions'
-    runs-on: ubuntu-22.04
-    steps:
-      - name: 'Check out repository'
-        uses: actions/checkout@v4
-
-      - name: 'Set vars'
-        shell: bash
-        run: |
-          OS=$(echo '${{ runner.os }}' | awk '{print tolower($0)}')
-          [[ $OS == 'ubuntu' ]] && echo "OS=linux" >> $GITHUB_ENV || echo "OS=$OS" >> $GITHUB_ENV
-          [[ $OS == 'macos' ]] && echo "OS=darwin" >> $GITHUB_ENV || echo "OS=$OS" >> $GITHUB_ENV
-          echo "VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_ENV
-
-      - name: 'Set up Graal'
-        uses: graalvm/setup-graalvm@v1
-        with:
-          version: ${{ env.GRAALVM_VERSION }}
-          java-version: ${{ env.JAVA_VERSION }}
-          components: 'native-image'
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 'Build source distribution'
-        run: ./mvnw clean verify -Psource-distribution -N -B -ntp -e
-
-      - name: 'Upload artifact'
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifacts
-          path: |
-            target/maven-mvnd-*.zip
-            target/maven-mvnd-*.tar.gz
-
+        os:
+        - ubuntu-latest
+        - macos-latest
+        - windows-latest
   release:
-    runs-on: ubuntu-22.04
-    needs: [build, source]
-
+    needs:
+    - build
+    - source
+    runs-on: self-hosted
     steps:
-      - name: 'Check out repository'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - continue-on-error: true
+      name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - continue-on-error: true
+      name: Download all build artifacts
+      uses: actions/download-artifact@v4
+    - continue-on-error: true
+      name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: zulu
+        java-version: ${{ env.JAVA_VERSION }}
+    - continue-on-error: true
+      name: Cache Maven packages
+      uses: actions/cache@v4
+      with:
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        path: ~/.m2
+        restore-keys: ${{ runner.os }}-m2
+    - continue-on-error: true
+      name: ls -R
+      run: ls -R
+    - continue-on-error: true
+      name: Set environment
+      run: 'echo "VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)"
+        >> $GITHUB_ENV
 
-      - name: 'Download all build artifacts'
-        uses: actions/download-artifact@v4
+        '
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      id: create_release
+      name: Create Release
+      uses: actions/create-release@v1
+      with:
+        draft: true
+        prerelease: false
+        release_name: ${{ env.VERSION }}
+        tag_name: ${{ env.VERSION }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-src.zip
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/zip
+        asset_name: maven-mvnd-${{ env.VERSION }}-src.zip
+        asset_path: artifacts/maven-mvnd-${{ env.VERSION }}-src.zip
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-src.tar.gz
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/tar.gz
+        asset_name: maven-mvnd-${{ env.VERSION }}-src.tar.gz
+        asset_path: artifacts/maven-mvnd-${{ env.VERSION }}-src.tar.gz
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-linux-amd64.zip
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/zip
+        asset_name: maven-mvnd-${{ env.VERSION }}-linux-amd64.zip
+        asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-linux-amd64.zip
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-linux-amd64.tar.gz
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/x-gzip
+        asset_name: maven-mvnd-${{ env.VERSION }}-linux-amd64.tar.gz
+        asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-linux-amd64.tar.gz
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-darwin-amd64.zip
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/zip
+        asset_name: maven-mvnd-${{ env.VERSION }}-darwin-amd64.zip
+        asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-darwin-amd64.zip
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-darwin-amd64.tar.gz
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/x-gzip
+        asset_name: maven-mvnd-${{ env.VERSION }}-darwin-amd64.tar.gz
+        asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-darwin-amd64.tar.gz
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-windows-amd64.zip
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/zip
+        asset_name: maven-mvnd-${{ env.VERSION }}-windows-amd64.zip
+        asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-windows-amd64.zip
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+    - continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Deploy maven-mvnd-windows-amd64.tar.gz
+      uses: actions/upload-release-asset@v1
+      with:
+        asset_content_type: application/x-gzip
+        asset_name: maven-mvnd-${{ env.VERSION }}-windows-amd64.tar.gz
+        asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-windows-amd64.tar.gz
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+  source:
+    name: Build source distributions
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Check out repository
+      uses: actions/checkout@v4
+    - continue-on-error: true
+      name: Set vars
+      run: 'OS=$(echo ''${{ runner.os }}'' | awk ''{print tolower($0)}'')
 
-      - name: 'Set up Java'
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'zulu'
+        [[ $OS == ''ubuntu'' ]] && echo "OS=linux" >> $GITHUB_ENV || echo "OS=$OS"
+        >> $GITHUB_ENV
 
-      - name: 'Cache Maven packages'
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-m2
+        [[ $OS == ''macos'' ]] && echo "OS=darwin" >> $GITHUB_ENV || echo "OS=$OS"
+        >> $GITHUB_ENV
 
-      - name: ls -R
-        run: ls -R
+        echo "VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)"
+        >> $GITHUB_ENV
 
-      - name: Set environment
-        run: |
-          echo "VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_ENV
+        '
+      shell: bash
+    - continue-on-error: true
+      name: Set up Graal
+      uses: graalvm/setup-graalvm@v1
+      with:
+        components: native-image
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        java-version: ${{ env.JAVA_VERSION }}
+        version: ${{ env.GRAALVM_VERSION }}
+    - continue-on-error: true
+      name: Build source distribution
+      run: ./mvnw clean verify -Psource-distribution -N -B -ntp -e
+    - continue-on-error: true
+      name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: artifacts
+        path: 'target/maven-mvnd-*.zip
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.VERSION }}
-          release_name: ${{ env.VERSION }}
-          draft: true
-          prerelease: false
+          target/maven-mvnd-*.tar.gz
 
-      - name: Deploy maven-mvnd-src.zip
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/maven-mvnd-${{ env.VERSION }}-src.zip
-          asset_name: maven-mvnd-${{ env.VERSION }}-src.zip
-          asset_content_type: application/zip
-
-      - name: Deploy maven-mvnd-src.tar.gz
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/maven-mvnd-${{ env.VERSION }}-src.tar.gz
-          asset_name: maven-mvnd-${{ env.VERSION }}-src.tar.gz
-          asset_content_type: application/tar.gz
-
-      - name: Deploy maven-mvnd-linux-amd64.zip
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-linux-amd64.zip
-          asset_name: maven-mvnd-${{ env.VERSION }}-linux-amd64.zip
-          asset_content_type: application/zip
-
-      - name: Deploy maven-mvnd-linux-amd64.tar.gz
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-linux-amd64.tar.gz
-          asset_name: maven-mvnd-${{ env.VERSION }}-linux-amd64.tar.gz
-          asset_content_type: application/x-gzip
-
-      - name: Deploy maven-mvnd-darwin-amd64.zip
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-darwin-amd64.zip
-          asset_name: maven-mvnd-${{ env.VERSION }}-darwin-amd64.zip
-          asset_content_type: application/zip
-
-      - name: Deploy maven-mvnd-darwin-amd64.tar.gz
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-darwin-amd64.tar.gz
-          asset_name: maven-mvnd-${{ env.VERSION }}-darwin-amd64.tar.gz
-          asset_content_type: application/x-gzip
-
-      - name: Deploy maven-mvnd-windows-amd64.zip
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-windows-amd64.zip
-          asset_name: maven-mvnd-${{ env.VERSION }}-windows-amd64.zip
-          asset_content_type: application/zip
-
-      - name: Deploy maven-mvnd-windows-amd64.tar.gz
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/dist/target/maven-mvnd-${{ env.VERSION }}-windows-amd64.tar.gz
-          asset_name: maven-mvnd-${{ env.VERSION }}-windows-amd64.tar.gz
-          asset_content_type: application/x-gzip
-
+          '
+name: Release
+on:
+  repository_dispatch:
+    types: trigger-ga___release.yaml
